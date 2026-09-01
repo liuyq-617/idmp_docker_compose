@@ -1,0 +1,226 @@
+services:
+  tdengine-tdgpt:
+    image: tdengine/tdgpt-lite:${TDGPT_TAG:-latest}
+    container_name: tdengine-tdgpt
+    hostname: tdengine-tdgpt
+    restart: always
+    environment:
+      TZ: "${TZ:-UTC}"
+      TDGPT_RESOURCE_BASE_URL: "${TDGPT_RESOURCE_BASE_URL:-https://downloads.taosdata.com}"
+    ports:
+      - "6035:6035"
+      - "6061:6061"
+      - "6062:6062"
+      - "6063:6063"
+      - "6064:6064"
+      - "6065:6065"
+      - "6066:6066"
+    volumes:
+      - ./tdgpt-data/model:/var/lib/taos/taosanode/model
+      - ./tdgpt-data/model_venvs:/var/lib/taos/taosanode/model_venvs
+      - ./tdgpt-data/resource:/var/lib/taos/taosanode/resource
+    networks:
+      - taos_net
+    healthcheck:
+      test: [
+        "CMD",
+        "python3",
+        "-c",
+        "import urllib.request; urllib.request.urlopen('http://localhost:6035').read()"
+      ]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 60s
+
+  tdengine-tsdb:
+    image: tdengine/tsdb-ee:${TSDB_TAG:-latest}
+    container_name: tdengine-tsdb
+    hostname: tdengine
+    restart: always
+    environment:
+      TZ: "${TZ:-UTC}"
+      EXPLORER_SKIP_REGISTER: "${EXPLORER_SKIP_REGISTER:-true}"
+      TAOS_FQDN: "${TAOS_FQDN:-tdengine-tsdb}"
+      EXPLORER_ALLOWED_ORIGINS: "${EXPLORER_ALLOWED_ORIGINS:-http://localhost:6042,https://localhost:6034}"
+    ports:
+      - "6030:6030"
+      - "6041:6041"
+      - "6055:6055"
+      - "6060:6060"
+    volumes:
+      - tsdb_data:/var/lib/taos
+      - tsdb_log:/var/log/taos
+      - ./init-anode.sql:/docker-entrypoint-initdb.d/init-anode.sql
+    networks:
+      - taos_net
+    depends_on:
+      tdengine-tdgpt:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "curl -s -m 5 -u root:taosdata 'http://localhost:6041/rest/sql' -d 'show databases' | grep -q '\"code\":0' || exit 1"]
+      interval: 30s
+      timeout: 60s
+      retries: 5
+      start_period: 30s
+
+  tdengine-idmp-backend:
+    image: tdengine/idmp-backend-ee:${IDMP_TAG:-latest}
+    container_name: tdengine-idmp-backend
+    restart: always
+    depends_on:
+      tdengine-tsdb:
+        condition: service_healthy
+      tdengine-cls:
+        condition: service_healthy
+    environment:
+      TZ: "${TZ:-UTC}"
+      TSDB_URL: "http://tdengine-tsdb:6041"
+      TDA_ANALYSIS_EVENT_URLS: "ws://tdengine-idmp-backend:6042"
+      QUARKUS_PROFILE: "${QUARKUS_PROFILE:-prod}"
+      IDMP_URL: "${IDMP_URL:-http://localhost:6042}"
+      TDA_REST_BASE_PATH: "${TDA_REST_BASE_PATH:-}"
+      TDA_LICENSE_SERVER_ADDR: "${TDA_LICENSE_SERVER_ADDR:-http://tdengine-cls:6059}"
+      AI_SERVER_URL: "http://tdengine-idmp-ai:6040"
+      TDA_AI_CONN_ZH: "${TDA_AI_CONN_ZH:-DeepSeek}"
+      TDA_AI_CONN_EN: "${TDA_AI_CONN_EN:-OpenAI}"
+      TDA_GIT_ENABLE: "${TDA_GIT_ENABLE:-false}"
+      TDA_MODEL_SERVICE_URL: "${TDA_MODEL_SERVICE_URL:-http://tdengine-model:6036}"
+      TDA_ALL_IN_ONE: "${TDA_ALL_IN_ONE:-true}"
+      JAVA_XMS: "${JAVA_XMS:-2g}"
+      JAVA_XMX: "${JAVA_XMX:-4g}"
+      JAVA_OPTS: "${JAVA_OPTS:-}"
+    ports:
+      - "6038:6038"
+    volumes:
+      - idmp_data:/var/lib/taos/idmp
+      - idmp_log:/var/log/taos
+    networks:
+      - taos_net
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sf http://localhost:6042/q/health || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 30s
+
+  tdengine-idmp-ui:
+    image: tdengine/idmp-ui-ee:${IDMP_TAG:-latest}
+    container_name: tdengine-idmp-ui
+    restart: always
+    depends_on:
+      tdengine-idmp-backend:
+        condition: service_healthy
+    environment:
+      TZ: "${TZ:-UTC}"
+      IDMP_BACKEND_UPSTREAM: "${IDMP_BACKEND_UPSTREAM:-tdengine-idmp-backend:6042}"
+      # Docker 内嵌 DNS。后端容器重启换 IP 时 nginx 靠它动态重解析（见 nginx 模板）。
+      IDMP_NGINX_RESOLVER: "${IDMP_NGINX_RESOLVER:-127.0.0.11}"
+    ports:
+      - "6042:80"
+      - "6034:443"
+    volumes:
+      - idmp_data:/var/lib/taos/idmp
+      - idmp_log:/var/log/taos
+    networks:
+      - taos_net
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://127.0.0.1:80/ >/dev/null && wget --no-check-certificate -qO- https://127.0.0.1:443/ >/dev/null || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 10s
+
+  tdengine-idmp-ai:
+    image: tdengine/idmp-ai-ee:${IDMP_AI_TAG:-latest}
+    container_name: tdengine-idmp-ai
+    restart: always
+    environment:
+      TZ: "${TZ:-UTC}"
+      IDMP_URL: "${IDMP_URL:-http://tdengine-idmp-backend:6042}"
+      IDMP_JAVA_API_URL: "http://tdengine-idmp-backend:6042/"
+      TDA_AI_CONN_ZH: "${TDA_AI_CONN_ZH:-DeepSeek}"
+      TDA_AI_CONN_EN: "${TDA_AI_CONN_EN:-OpenAI}"
+    ports:
+      - "6040:6040"
+    volumes:
+      - idmp_data:/var/lib/taos/idmp
+      - idmp_log:/var/log/taos
+    networks:
+      - taos_net
+    healthcheck:
+      test: ["CMD-SHELL", "bash -c '</dev/tcp/localhost/6040' || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 30s
+
+  tdengine-model:
+    image: tdengine/tdmodel:${TDMODEL_TAG:-latest}
+    container_name: tdengine-model
+    restart: always
+    depends_on:
+      tdengine-tsdb:
+        condition: service_healthy
+    environment:
+      TZ: "${TZ:-UTC}"
+      TDMODEL_TSDB_HOST: "${TDMODEL_TSDB_HOST:-tdengine-tsdb}"
+      TDMODEL_TSDB_PORT: "${TDMODEL_TSDB_PORT:-6041}"
+    ports:
+      - "6036:6036"
+    volumes:
+      - tdmodel_data:/var/lib/taos
+      - tdmodel_mysql:/var/lib/mysql
+      - tdmodel_log:/var/log/taos
+    networks:
+      - taos_net
+    healthcheck:
+      test: ["CMD-SHELL", "bash -c '</dev/tcp/localhost/6036' || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 30s
+
+  tdengine-cls:
+    image: tdengine/cls:${CLS_TAG:-latest}
+    container_name: tdengine-cls
+    restart: always
+    environment:
+      TZ: "${TZ:-UTC}"
+    ports:
+      - "6059:6059"
+    volumes:
+      - cls_data:/var/lib/taoscls
+      - cls_log:/var/log/taoscls
+    networks:
+      - taos_net
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sf http://localhost:6059/health || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 30s
+
+networks:
+  taos_net:
+    driver: bridge
+
+volumes:
+  tsdb_data:
+    driver: local
+  tsdb_log:
+    driver: local
+  idmp_data:
+    driver: local
+  idmp_log:
+    driver: local
+  tdmodel_data:
+    driver: local
+  tdmodel_mysql:
+    driver: local
+  tdmodel_log:
+    driver: local
+  cls_data:
+    driver: local
+  cls_log:
+    driver: local
