@@ -1,0 +1,29 @@
+name: Sync TDengine Docker Compose
+
+on:
+  schedule:
+    # 每 10 分钟触发一次
+    - cron: '*/10 * * * *'
+  workflow_dispatch: # 支持在 GitHub 页面手动点击触发
+
+# 赋予 GITHUB_TOKEN 写权限以便 push 代码
+permissions:
+  contents: write
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Download latest docker-compose file
+        run: |
+          curl -sSL -f https://downloads.taosdata.com/apex/docker/v1.0.0/docker-compose-tdengine.yml -o docker-compose-tdengine.yml
+
+      - name: Commit and push if changed
+        uses: stefanzweifel/git-auto-commit-action@v5
+        with:
+          commit_message: "chore: update docker-compose-tdengine.yml to latest upstream"
+          file_pattern: "docker-compose-tdengine.yml"
